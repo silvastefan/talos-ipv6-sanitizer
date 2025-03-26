@@ -14,6 +14,11 @@ Passo a Passo de Deploy
    2. cd talos-ipv6-sanitizer
 2. Monte a imagem Docker
    1. docker build -t stefansilva/talos-ipv6-sanitizer .
+   2. docker buildx build \
+  --platform=linux/amd64 \
+  -t stefansilva/talos-ipv6-sanitizer:latest \
+  . \
+  --push
 3. Faça o push da imagem para o seu registry (Docker Hub, GitHub Container Registry, etc.):
    1. docker push stefansilva/talos-ipv6-sanitizer:latest
 4. Edite o arquivo 04-deployment.yaml na parte de image: "seu-registro/talos-ipv6-sanitizer:latest" para apontar para a imagem que você acabou de enviar.
