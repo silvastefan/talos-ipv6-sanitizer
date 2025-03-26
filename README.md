@@ -12,8 +12,9 @@ Passo a Passo de Deploy
 1. Clone ou baixe seu repositório localmente:
    1. git clone https://github.com/silvastefan/talos-ipv6-sanitizer.git
    2. cd talos-ipv6-sanitizer
-2. Monte a imagem Docker
+2. Monte a imagem Docker 
    docker build -t stefansilva/talos-ipv6-sanitizer .
+3. Monte a imagem Docker para arm / x86
    docker buildx build \
   --platform=linux/amd64 \
   -t stefansilva/talos-ipv6-sanitizer:latest \
