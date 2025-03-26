@@ -1,4 +1,6 @@
 from kubernetes import client, config, watch
+from urllib3.exceptions import ReadTimeoutError
+import time
 
 def is_ipv4(address: str) -> bool:
     """
@@ -43,32 +45,43 @@ def main():
 
     print("Iniciando controller para remover IPv6 das anotações de Node...")
 
-    for event in w.stream(v1.list_node, _request_timeout=60):
-        # Verifica se o tipo de evento é 'ADDED' ou 'MODIFIED'
-        if event['type'] in ['ADDED', 'MODIFIED']:
-            node = event['object']
-            annotations = node.metadata.annotations or {}
-            ip_annotation_key = 'alpha.kubernetes.io/provided-node-ip'
+    while True:
+        try:
+            for event in w.stream(v1.list_node, _request_timeout=60):
+                # Verifica se o tipo de evento é 'ADDED' ou 'MODIFIED'
+                if event['type'] in ['ADDED', 'MODIFIED']:
+                    node = event['object']
+                    annotations = node.metadata.annotations or {}
+                    ip_annotation_key = 'alpha.kubernetes.io/provided-node-ip'
 
-            if ip_annotation_key in annotations:
-                original_value = annotations[ip_annotation_key]
-                new_value = remove_ipv6_from_annotation(original_value)
-                
-                if new_value != original_value:
-                    print(f"[INFO] Node {node.metadata.name}: alterando anotação de '{original_value}' para '{new_value}'")
-                    
-                    body = {
-                        "metadata": {
-                            "annotations": {
-                                ip_annotation_key: new_value
+                    if ip_annotation_key in annotations:
+                        original_value = annotations[ip_annotation_key]
+                        new_value = remove_ipv6_from_annotation(original_value)
+                        
+                        if new_value != original_value:
+                            print(f"[INFO] Node {node.metadata.name}: alterando anotação de '{original_value}' para '{new_value}'")
+                            
+                            body = {
+                                "metadata": {
+                                    "annotations": {
+                                        ip_annotation_key: new_value
+                                    }
+                                }
                             }
-                        }
-                    }
-                    try:
-                        v1.patch_node(node.metadata.name, body)
-                        print(f"[INFO] Node {node.metadata.name} atualizado com sucesso.")
-                    except Exception as e:
-                        print(f"[ERRO] Falha ao atualizar Node {node.metadata.name}: {e}")
-
+                            try:
+                                v1.patch_node(node.metadata.name, body)
+                                print(f"[INFO] Node {node.metadata.name} atualizado com sucesso.")
+                            except Exception as e:
+                                print(f"[ERRO] Falha ao atualizar Node {node.metadata.name}: {e}")
+        except ReadTimeoutError:
+            print("[WARN] Timeout na conexão Watch. Reiniciando watch...")
+            time.sleep(1)
+            continue  # Reinicia o while True
+        except Exception as e:
+            # Se quiser tratar outros erros, faça aqui
+            print(f"[ERRO] Ocorreu um erro inesperado: {e}")
+            time.sleep(5)
+            continue
+        
 if __name__ == "__main__":
     main()
