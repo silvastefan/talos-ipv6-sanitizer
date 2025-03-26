@@ -17,5 +17,5 @@ spec:
       containers:
         - name: talos-ipv6-sanitizer
           # Altere aqui para o repositório/nome da imagem que você fizer push
-          image: "seu-registro/talos-ipv6-sanitizer:latest"
+          image: "stefansilva/talos-ipv6-sanitizer:latest"
           imagePullPolicy: Always
