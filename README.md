@@ -16,3 +16,5 @@ Passo a Passo de Deploy
    1. kubectl get pods -l app=talos-ipv6-sanitizer
 7. Confira os logs para confirmar que o código está rodando:
    1. kubectl logs -f deployment/talos-ipv6-sanitizer-deployment
+8. Sempre que um Node novo (ou modificado) for detectado com a anotação
+alpha.kubernetes.io/provided-node-ip contendo IPv6, o controller irá removê-lo e manter somente o(s) IPv4.
