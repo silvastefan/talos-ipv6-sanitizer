@@ -1,0 +1,4 @@
+replicaCount: 1
+image:
+  repository: seu-usuario/ipv6-operator
+  tag: latest

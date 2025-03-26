@@ -1,0 +1,5 @@
+apiVersion: v2
+name: talos-ipv6-sanitizer
+description: A Helm chart for Kubernetes to sanitize IPv6 in Talos nodes
+version: 0.1.0
+appVersion: "1.0"
