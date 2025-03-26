@@ -2,6 +2,8 @@
 
 FROM python:3.9-slim
 
+ENV PYTHONUNBUFFERED=1  
+
 WORKDIR /app
 
 # Instala dependências
@@ -12,4 +14,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 
 # Executa o script quando o container iniciar
-CMD ["python", "main.py"]
+CMD ["python", "-u", "main.py"]
