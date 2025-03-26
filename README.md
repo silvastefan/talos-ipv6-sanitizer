@@ -1,3 +1,13 @@
+talos-ipv6-sanitizer/
+├── Dockerfile
+├── main.py
+├── requirements.txt
+└── k8s
+    ├── 01-serviceaccount.yaml
+    ├── 02-clusterrole.yaml
+    ├── 03-clusterrolebinding.yaml
+    └── 04-deployment.yaml
+    
 Passo a Passo de Deploy
 1. Clone ou baixe seu repositório localmente:
    1. git clone https://github.com/silvastefan/talos-ipv6-sanitizer.git
