@@ -34,3 +34,11 @@ Passo a Passo de Deploy
    1. kubectl logs -f deployment/talos-ipv6-sanitizer-deployment
 9. Sempre que um Node novo (ou modificado) for detectado com a anotação
 alpha.kubernetes.io/provided-node-ip contendo IPv6, o controller irá removê-lo e manter somente o(s) IPv4.
+10. criar node worker e verificar se o ipv6 vai ser removido de forma automatica
+hcloud server create --name talos-worker-template-v15 \
+--image ${IMAGE_ID} \
+--type cx22 \
+--location hel1 \
+--label 'type=worker' \
+--network 10824191 \
+--user-data-from-file worker.yaml
