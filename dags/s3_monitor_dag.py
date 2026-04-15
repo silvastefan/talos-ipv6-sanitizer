@@ -140,17 +140,41 @@ class S3NovosArquivosSensor(BaseSensorOperator):
 # ─────────────────────────────────────────────────────────────────────────────
 # Utilitários S3
 # ─────────────────────────────────────────────────────────────────────────────
-def _calcular_destino(chave: str, prefixo_origem: str, prefixo_destino: str) -> str:
+def _calcular_destino_processados(
+    chave: str, prefixo_origem: str, prefixo_processados: str, data_execucao: str
+) -> str:
     """
-    Calcula o caminho de destino preservando a estrutura de subpastas.
+    Calcula o caminho de destino para arquivos processados com sucesso.
+
+    Inclui partição por data (ano/mes/dia) com base na data de execução da DAG,
+    preservando a estrutura de subpastas relativa ao prefixo monitorado.
+
+    Parâmetros
+    ----------
+    data_execucao : str
+        Data no formato 'YYYY/MM/DD', extraída do logical_date da DAG run.
+
+    Exemplos (data_execucao = '2024/01/15'):
+        "incoming/arquivo.csv"         → "processed/2024/01/15/arquivo.csv"
+        "incoming/pasta/arquivo.csv"   → "processed/2024/01/15/pasta/arquivo.csv"
+        "incoming/a/b/arquivo.parquet" → "processed/2024/01/15/a/b/arquivo.parquet"
+    """
+    caminho_relativo = chave[len(prefixo_origem):]
+    return f"{prefixo_processados.rstrip('/')}/{data_execucao}/{caminho_relativo}"
+
+
+def _calcular_destino_erros(chave: str, prefixo_origem: str, prefixo_erros: str) -> str:
+    """
+    Calcula o caminho de destino para arquivos que falharam.
+
+    Preserva a estrutura de subpastas, sem partição por data.
 
     Exemplos:
-        chave = "incoming/arquivo.csv"           → "processed/arquivo.csv"
-        chave = "incoming/pasta/arquivo.csv"     → "processed/pasta/arquivo.csv"
-        chave = "incoming/a/b/arquivo.parquet"   → "processed/a/b/arquivo.parquet"
+        "incoming/arquivo.csv"       → "errors/arquivo.csv"
+        "incoming/pasta/arquivo.csv" → "errors/pasta/arquivo.csv"
     """
-    caminho_relativo = chave[len(prefixo_origem):]          # remove o prefixo de origem
-    return f"{prefixo_destino.rstrip('/')}/{caminho_relativo}"
+    caminho_relativo = chave[len(prefixo_origem):]
+    return f"{prefixo_erros.rstrip('/')}/{caminho_relativo}"
 
 
 def _mover_arquivo_s3(hook, bucket: str, origem: str, destino: str) -> None:
@@ -178,6 +202,7 @@ def _processar_um_arquivo(
     prefixo_origem: str,
     prefixo_processados: str,
     prefixo_erros: str,
+    data_execucao: str,
 ) -> Dict:
     """
     Processa um único arquivo e o move para o destino adequado.
@@ -226,8 +251,10 @@ def _processar_um_arquivo(
         log.info("Arquivo lido (%d bytes). Aplicando lógica de negócio...", len(conteudo))
         # FIM DA LÓGICA DE NEGÓCIO ─────────────────────────────────────
 
-        # Sucesso: move para 'processados/' preservando subpastas
-        destino = _calcular_destino(chave, prefixo_origem, prefixo_processados)
+        # Sucesso: move para 'processados/ano/mes/dia/' preservando subpastas
+        destino = _calcular_destino_processados(
+            chave, prefixo_origem, prefixo_processados, data_execucao
+        )
         _mover_arquivo_s3(hook, bucket, chave, destino)
         log.info("── Sucesso: %s", chave)
         return {"chave": chave, "status": "sucesso", "destino": destino}
@@ -235,8 +262,8 @@ def _processar_um_arquivo(
     except Exception as exc:
         log.error("── Falha: %s | Erro: %s", chave, exc)
 
-        # Falha: move para 'erros/' preservando subpastas
-        destino_erro = _calcular_destino(chave, prefixo_origem, prefixo_erros)
+        # Falha: move para 'erros/' preservando subpastas (sem partição por data)
+        destino_erro = _calcular_destino_erros(chave, prefixo_origem, prefixo_erros)
         try:
             _mover_arquivo_s3(hook, bucket, chave, destino_erro)
         except Exception as move_exc:
@@ -285,6 +312,12 @@ def processar_arquivos(**context) -> None:
     aws_conn_id = params.get("aws_conn_id", _DEFAULT_CONN)
     max_paralelo = int(params.get("max_paralelo", 0))
 
+    # Data de execução da DAG run: usada para particionar o destino dos processados.
+    # Usa logical_date (Airflow 2.2+) com fallback para execution_date.
+    data_dt = context.get("logical_date") or context["execution_date"]
+    data_execucao = data_dt.strftime("%Y/%m/%d")  # ex: "2024/01/15"
+    log.info("Data de particionamento: %s", data_execucao)
+
     arquivos: List[str] = ti.xcom_pull(
         task_ids="monitorar_s3", key="arquivos_encontrados"
     )
@@ -301,6 +334,7 @@ def processar_arquivos(**context) -> None:
         prefixo_origem=prefixo_monitorado,
         prefixo_processados=prefixo_processados,
         prefixo_erros=prefixo_erros,
+        data_execucao=data_execucao,
     )
 
     resultados: List[Dict] = []
