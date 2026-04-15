@@ -5,6 +5,60 @@ decisões de design e comportamentos em cada cenário de execução.
 
 ---
 
+## 0. Modelo Event-Driven vs Polling
+
+### Por que não usar polling para arquivos mensais
+
+O `S3KeySensor` e o `S3PrefixSensor` nativos do Airflow usam **polling**: ficam
+verificando o S3 periodicamente e falham quando o timeout expira sem arquivo.
+Para arquivos mensais, isso gera **falsos alertas de FAILED** — o arquivo não chegou
+porque ainda não é a hora, não porque houve erro.
+
+Nossa solução usa um **sensor customizado com `soft_fail=True`**, o que converte
+timeout em SKIPPED (sem alerta). Mas polling com `schedule_interval` curto ainda
+gera dezenas de execuções desnecessárias por mês.
+
+### Solução adotada: Event-Driven
+
+A DAG tem `schedule_interval=None` — **não roda por agendamento**. Ela só é
+disparada quando um arquivo realmente chega no S3:
+
+```mermaid
+flowchart LR
+    S3["📦 Arquivo chega\nno S3"]
+    EB["⚡ Amazon EventBridge\n*(ou S3 Event Notifications)*"]
+    LAMBDA["λ Lambda\nlambda_trigger.py"]
+    AIRFLOW["✈️ Airflow\nDAG Run criada"]
+
+    S3 -->|"s3:ObjectCreated"| EB
+    EB -->|"invoca"| LAMBDA
+    LAMBDA -->|"POST /api/v1/dags/.../dagRuns"| AIRFLOW
+```
+
+| | Polling | Event-Driven |
+|---|---------|--------------|
+| Execuções/mês (arquivo mensal) | ~180 | **1** |
+| Latência de detecção | até 5 min | **segundos** |
+| Falsos alertas de FAILED | possível (S3KeySensor padrão) | **impossível** |
+| Ruído operacional (SKIPPED) | alto | **zero** |
+| Infraestrutura adicional | nenhuma | EventBridge + Lambda |
+
+### Quando usar polling mesmo assim
+
+Se não for possível configurar EventBridge/Lambda, use polling com frequência
+adequada à janela esperada:
+
+```python
+# Para arquivos mensais — polling como fallback
+schedule_interval = "@daily"         # 30 execuções/mês (vs 8.640 com 5 min)
+timeout           = 60 * 60 * 23     # 23 horas por run
+soft_fail         = True             # timeout → SKIPPED, não FAILED
+```
+
+---
+
+---
+
 ## 1. Visão Geral do Fluxo
 
 ```mermaid

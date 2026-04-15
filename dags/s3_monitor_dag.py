@@ -908,7 +908,21 @@ with DAG(
     # Frequência de execução da DAG.
     # O sensor interno verifica o S3 a cada 30s dentro de cada execução.
     # Ajuste conforme a latência aceitável para detecção de novos arquivos.
-    schedule_interval=timedelta(minutes=5),
+    # schedule_interval=None significa que a DAG NÃO roda por agendamento.
+    # Ela só executa quando disparada externamente (S3 Event → Lambda → REST API).
+    # Para arquivos mensais (ou de qualquer frequência imprevisível), este é o
+    # modelo correto: event-driven, sem polling e sem falsos alertas de timeout.
+    #
+    # Se preferir manter polling (ex: em ambientes sem acesso a EventBridge/Lambda),
+    # substitua por uma frequência adequada à janela esperada de chegada do arquivo:
+    #   schedule_interval="@daily"    → verifica 1x/dia   (30 runs/mês)
+    #   schedule_interval="@hourly"   → verifica 1x/hora  (720 runs/mês)
+    #   schedule_interval=timedelta(minutes=5)  → NÃO recomendado para arquivos mensais
+    #
+    # Importante: com soft_fail=True no sensor, timeout → SKIPPED (não FAILED),
+    # portanto não gera alertas de erro. O problema do S3KeySensor/S3PrefixSensor
+    # padrão (que falham no timeout) NÃO se aplica a este sensor customizado.
+    schedule_interval=None,  # event-driven: disparado pelo Lambda (ver infra/lambda_trigger.py)
 
     # Data de início das execuções agendadas
     start_date=days_ago(1),
@@ -974,10 +988,17 @@ with DAG(
         file_pattern="{{ params.padrao_arquivo }}",
         aws_conn_id="{{ params.aws_conn_id }}",
 
-        poke_interval=30,         # verifica o S3 a cada 30 segundos
-        timeout=60 * 60 * 4,     # timeout após 4 horas sem arquivo
+        # Com schedule_interval=None (event-driven), a DAG só é disparada pelo
+        # Lambda após o S3 confirmar que um arquivo chegou. O sensor serve como
+        # segunda linha de defesa: confirma que o arquivo ainda está acessível
+        # antes de iniciar o processamento.
+        #
+        # poke_interval curto + timeout curto são suficientes aqui, pois o arquivo
+        # já deveria estar presente quando a DAG é disparada.
+        poke_interval=30,         # verifica a cada 30 segundos
+        timeout=60 * 10,          # timeout de 10 min (arquivo deve estar lá; se não estiver, é erro real)
         mode="reschedule",        # libera o worker entre os pokes
-        soft_fail=True,           # timeout → SKIPPED, não FAILED
+        soft_fail=False,          # timeout aqui É um erro real (arquivo sumiu após notificação)
 
         doc_md=(
             "**Sensor S3 — monitorar_s3**\n\n"
