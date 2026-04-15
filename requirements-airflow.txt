@@ -1,0 +1,19 @@
+# Dependências adicionais do Airflow
+# Instaladas sobre a imagem oficial apache/airflow:2.9.2
+#
+# Adicione aqui os pacotes específicos da sua lógica de negócio.
+
+# Provider AWS (S3Hook, S3KeySensor, SnsHook, etc.)
+apache-airflow-providers-amazon==8.22.0
+
+# Exemplos de pacotes para lógica de negócio (descomente conforme necessário)
+# pandas==2.2.2          # Manipulação de CSV/Excel
+# openpyxl==3.1.2        # Leitura/escrita de .xlsx
+# pyarrow==16.1.0        # Parquet
+# sqlalchemy==2.0.31     # Conexão com banco relacional
+# psycopg2-binary==2.9.9 # PostgreSQL
+# requests==2.32.3       # Chamadas HTTP / APIs externas
+
+# Notificações (descomente o provider desejado)
+# apache-airflow-providers-slack==8.7.1   # Slack
+# apache-airflow-providers-smtp==1.7.1    # E-mail via SMTP

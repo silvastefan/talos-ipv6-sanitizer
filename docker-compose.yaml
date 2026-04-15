@@ -1,0 +1,128 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Airflow + PostgreSQL — ambiente local de desenvolvimento
+#
+# Uso rápido:
+#   1. cp .env.example .env          (ajuste as variáveis)
+#   2. docker compose up airflow-init  (inicializa banco e admin)
+#   3. docker compose up -d            (sobe todos os serviços)
+#   4. Acesse http://localhost:8080   (admin / admin)
+#
+# Configurar conexão AWS (uma das opções):
+#   A) Via interface: Admin → Connections → aws_default
+#      Conn Type: Amazon Web Services
+#      Extra: {"region_name": "us-east-1"}
+#      Login: <AWS_ACCESS_KEY_ID>
+#      Password: <AWS_SECRET_ACCESS_KEY>
+#
+#   B) Via variável de ambiente (já mapeada abaixo se AWS_* estiver no .env):
+#      AIRFLOW_CONN_AWS_DEFAULT=aws://ACCESS_KEY:SECRET_KEY@?region_name=us-east-1
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.2-python3.11
+  environment:
+    # Banco de metadados
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+
+    # Executor local (sem Celery/Redis)
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+
+    # Desativa exemplos para não poluir a interface
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+    # Fuso horário
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: America/Sao_Paulo
+
+    # Habilita a interface de params ao disparar DAG manualmente
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+
+    # ── Credenciais AWS ────────────────────────────────────────────────
+    # Opção A: passe diretamente via .env
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+
+    # Opção B: cria a conexão aws_default automaticamente via env
+    # Descomente e ajuste se preferir não usar a interface do Airflow:
+    # AIRFLOW_CONN_AWS_DEFAULT: >-
+    #   aws://${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}@?region_name=${AWS_DEFAULT_REGION:-us-east-1}
+
+    # ── Variáveis da DAG ───────────────────────────────────────────────
+    AIRFLOW_VAR_S3_BUCKET: ${S3_BUCKET:-meu-bucket}
+    AIRFLOW_VAR_S3_MONITOR_PREFIX: ${S3_MONITOR_PREFIX:-incoming/}
+    AIRFLOW_VAR_S3_PROCESSED_PREFIX: ${S3_PROCESSED_PREFIX:-processed/}
+    AIRFLOW_VAR_S3_ERROR_PREFIX: ${S3_ERROR_PREFIX:-errors/}
+    AIRFLOW_VAR_S3_FILE_PATTERN: ${S3_FILE_PATTERN:-*}
+    AIRFLOW_VAR_AWS_CONN_ID: ${AWS_CONN_ID:-aws_default}
+
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./requirements-airflow.txt:/requirements-airflow.txt
+
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  # ── Banco de metadados ───────────────────────────────────────────────────
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── Inicialização (roda uma vez e termina) ───────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        pip install --no-cache-dir -r /requirements-airflow.txt
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+    restart: "no"
+
+  # ── Scheduler ────────────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob", "--limit", "1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ── Webserver ────────────────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  postgres_data:
