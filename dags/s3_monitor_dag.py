@@ -1,42 +1,44 @@
 """
 DAG: s3_monitor_e_processar
 ============================
-Monitora um prefixo (pasta) em um bucket S3 e, ao detectar novos arquivos,
-executa um processamento. Após o processamento:
+Monitora um prefixo (pasta) em um bucket S3 e, ao detectar novos arquivos
+(inclusive dentro de subpastas), processa cada um de forma independente.
 
-  - SUCESSO → arquivos movidos para o prefixo 'processados/'
-  - FALHA   → arquivos movidos para o prefixo 'erros/' + callback de notificação
+Resultado por arquivo:
+  - SUCESSO → movido para 'processados/' preservando estrutura de subpastas
+  - FALHA   → movido para 'erros/'     preservando estrutura de subpastas
 
-Configuração
-------------
-Defina as variáveis abaixo no Airflow (Admin → Variables) para sobrescrever
-os valores padrão. Alternativamente, passe os parâmetros diretamente ao
-disparar a DAG manualmente (Trigger DAG w/ config).
+Fluxo de execução:
+  monitorar_s3  →  processar_arquivos  →  notificar_falha (apenas se houver falha)
 
-  Variável Airflow          Padrão               Descrição
-  ─────────────────────     ──────────────────   ──────────────────────────────
-  s3_bucket                 meu-bucket           Nome do bucket S3
-  s3_monitor_prefix         incoming/            Prefixo/pasta a monitorar
-  s3_processed_prefix       processed/           Destino dos arquivos com sucesso
-  s3_error_prefix           errors/              Destino dos arquivos com falha
-  s3_file_pattern           *                    Filtro por nome (ex: *.csv)
-  aws_conn_id               aws_default          ID da conexão AWS no Airflow
+Modo de processamento (parâmetro 'max_paralelo'):
+  0  → sequencial: um arquivo de cada vez (padrão seguro)
+  N  → paralelo:   até N arquivos simultaneamente
 
-Fluxo de execução
------------------
-  monitorar_s3  →  processar_arquivos  →  mover_para_processados
-                          │
-                          └──(falha)──→  mover_para_erros
-                                              │
-                                              └──→  notificar_falha
+Exemplos de entrada suportados:
+  incoming/arquivo.csv                   ← arquivo na raiz do prefixo
+  incoming/relatorio/dados.csv           ← arquivo dentro de subpasta
+  incoming/2024/01/arquivo.parquet       ← arquivo em subpasta aninhada
+
+Configuração via Airflow Variables (Admin → Variables):
+  Variável                Padrão          Descrição
+  ─────────────────────   ───────────     ──────────────────────────────────────
+  s3_bucket               meu-bucket      Nome do bucket S3
+  s3_monitor_prefix       incoming/       Prefixo/pasta a monitorar
+  s3_processed_prefix     processed/      Destino dos arquivos com sucesso
+  s3_error_prefix         errors/         Destino dos arquivos com falha
+  s3_file_pattern         *               Filtro glob (ex: *.csv, dados_*.json)
+  aws_conn_id             aws_default     ID da conexão AWS no Airflow
 """
 
 import fnmatch
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
-from typing import List
+from typing import Dict, List
 
 from airflow import DAG
+from airflow.exceptions import AirflowException
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 from airflow.sensors.base import BaseSensorOperator
@@ -56,13 +58,16 @@ _DEFAULT_CONN = Variable.get("aws_conn_id", default_var="aws_default")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sensor customizado — verifica novos arquivos no S3
+# Sensor — verifica novos arquivos no S3 (recursivo, inclui subpastas)
 # ─────────────────────────────────────────────────────────────────────────────
 class S3NovosArquivosSensor(BaseSensorOperator):
     """
     Sensor que verifica periodicamente se há arquivos em um prefixo S3.
 
-    Quando arquivos são encontrados, armazena as chaves no XCom
+    A listagem é recursiva: detecta arquivos tanto na raiz do prefixo quanto
+    dentro de subpastas em qualquer nível de profundidade.
+
+    Quando encontra arquivos, armazena as chaves completas no XCom
     ('arquivos_encontrados') e retorna True para liberar as tarefas seguintes.
 
     Parâmetros
@@ -72,7 +77,8 @@ class S3NovosArquivosSensor(BaseSensorOperator):
     prefix : str
         Prefixo (pasta) a ser monitorado. Ex: 'incoming/' ou 'dados/entrada/'.
     file_pattern : str
-        Filtro por nome de arquivo (glob). Ex: '*.csv', 'relatorio_*.xlsx' ou '*'.
+        Filtro por nome de arquivo (glob). Aplicado apenas ao nome do arquivo,
+        não ao caminho completo. Ex: '*.csv', 'relatorio_*.xlsx' ou '*'.
     aws_conn_id : str
         ID da conexão AWS configurada no Airflow.
     """
@@ -105,12 +111,14 @@ class S3NovosArquivosSensor(BaseSensorOperator):
             self.file_pattern,
         )
 
+        # list_keys é recursivo: retorna todos os objetos sob o prefixo,
+        # incluindo os que estão dentro de subpastas.
         chaves = hook.list_keys(bucket_name=self.bucket_name, prefix=self.prefix) or []
 
-        # Ignora entradas que representam apenas subpastas (terminam com '/')
+        # Ignora marcadores de "pasta vazia" (chaves que terminam com '/')
         arquivos = [k for k in chaves if not k.endswith("/")]
 
-        # Aplica filtro de nome quando definido
+        # Aplica filtro de nome (somente sobre o nome do arquivo, não o caminho)
         if self.file_pattern and self.file_pattern != "*":
             arquivos = [
                 f for f in arquivos
@@ -121,27 +129,34 @@ class S3NovosArquivosSensor(BaseSensorOperator):
             self.log.info("Nenhum arquivo encontrado. Aguardando próxima verificação...")
             return False
 
-        self.log.info("Encontrado(s) %d arquivo(s): %s", len(arquivos), arquivos)
+        self.log.info("Encontrado(s) %d arquivo(s):", len(arquivos))
+        for a in arquivos:
+            self.log.info("  s3://%s/%s", self.bucket_name, a)
+
         context["ti"].xcom_push(key="arquivos_encontrados", value=arquivos)
         return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tarefas Python
+# Utilitários S3
 # ─────────────────────────────────────────────────────────────────────────────
-def _get_s3_conn(params: dict):
-    """Retorna (hook S3, nome do bucket) a partir dos params da DAG."""
-    from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+def _calcular_destino(chave: str, prefixo_origem: str, prefixo_destino: str) -> str:
+    """
+    Calcula o caminho de destino preservando a estrutura de subpastas.
 
-    bucket = params.get("bucket", _DEFAULT_BUCKET)
-    aws_conn_id = params.get("aws_conn_id", _DEFAULT_CONN)
-    return S3Hook(aws_conn_id=aws_conn_id), bucket
+    Exemplos:
+        chave = "incoming/arquivo.csv"           → "processed/arquivo.csv"
+        chave = "incoming/pasta/arquivo.csv"     → "processed/pasta/arquivo.csv"
+        chave = "incoming/a/b/arquivo.parquet"   → "processed/a/b/arquivo.parquet"
+    """
+    caminho_relativo = chave[len(prefixo_origem):]          # remove o prefixo de origem
+    return f"{prefixo_destino.rstrip('/')}/{caminho_relativo}"
 
 
 def _mover_arquivo_s3(hook, bucket: str, origem: str, destino: str) -> None:
     """
     Move um objeto S3: copia para o destino e remove o original.
-    (S3 não possui operação nativa de 'mover'.)
+    (O S3 não possui operação nativa de 'mover'.)
     """
     s3 = hook.get_conn()
     s3.copy_object(
@@ -153,34 +168,38 @@ def _mover_arquivo_s3(hook, bucket: str, origem: str, destino: str) -> None:
     log.info("Movido: s3://%s/%s  →  s3://%s/%s", bucket, origem, bucket, destino)
 
 
-def processar_arquivos(**context) -> None:
+# ─────────────────────────────────────────────────────────────────────────────
+# Processamento individual de cada arquivo
+# ─────────────────────────────────────────────────────────────────────────────
+def _processar_um_arquivo(
+    chave: str,
+    bucket: str,
+    aws_conn_id: str,
+    prefixo_origem: str,
+    prefixo_processados: str,
+    prefixo_erros: str,
+) -> Dict:
     """
-    Processa cada arquivo encontrado pelo sensor.
+    Processa um único arquivo e o move para o destino adequado.
 
-    Os arquivos são obtidos via XCom da tarefa 'monitorar_s3'.
-    Após o processamento, a lista de arquivos processados é publicada
-    no XCom ('arquivos_processados') para uso nas tarefas seguintes.
+    Retorna um dicionário com o resultado:
+        {"chave": str, "status": "sucesso"|"falha", "destino": str, "erro"?: str}
+
+    Esta função é chamada tanto no modo sequencial quanto no modo paralelo,
+    criando um S3Hook próprio para ser thread-safe.
 
     ╔══════════════════════════════════════════════════════════════════╗
-    ║  CUSTOMIZE AQUI: substitua o bloco marcado com sua lógica.      ║
+    ║  CUSTOMIZE AQUI: substitua o bloco de lógica de negócio.        ║
     ╚══════════════════════════════════════════════════════════════════╝
     """
-    ti = context["ti"]
-    params = context["params"]
-    hook, bucket = _get_s3_conn(params)
+    from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
-    arquivos: List[str] = ti.xcom_pull(
-        task_ids="monitorar_s3", key="arquivos_encontrados"
-    )
+    # Cada chamada cria seu próprio hook (thread-safe no modo paralelo)
+    hook = S3Hook(aws_conn_id=aws_conn_id)
 
-    if not arquivos:
-        raise ValueError("Sensor não retornou arquivos para processar.")
+    log.info("── Iniciando: s3://%s/%s", bucket, chave)
 
-    processados = []
-
-    for chave in arquivos:
-        log.info("── Iniciando processamento: s3://%s/%s", bucket, chave)
-
+    try:
         # ──────────────────────────────────────────────────────────────────
         # INÍCIO DA LÓGICA DE NEGÓCIO
         # Leia o arquivo e aplique sua transformação/validação/carga.
@@ -194,112 +213,172 @@ def processar_arquivos(**context) -> None:
         #
         #   Invocar API externa:
         #     import requests
-        #     r = requests.post("https://api.exemplo.com/processar", json={"arquivo": chave})
+        #     r = requests.post("https://api.exemplo.com/processar", json={"chave": chave})
         #     r.raise_for_status()
         #
         #   Invocar Lambda AWS:
-        #     import boto3
+        #     import boto3, json
         #     lam = boto3.client("lambda")
         #     lam.invoke(FunctionName="minha-funcao", Payload=json.dumps({"chave": chave}))
         # ──────────────────────────────────────────────────────────────────
         obj = hook.get_key(chave, bucket_name=bucket)
         conteudo = obj.get()["Body"].read()
-        log.info(
-            "Arquivo lido com sucesso (%d bytes). Aplicando lógica de negócio...",
-            len(conteudo),
-        )
+        log.info("Arquivo lido (%d bytes). Aplicando lógica de negócio...", len(conteudo))
         # FIM DA LÓGICA DE NEGÓCIO ─────────────────────────────────────
 
-        processados.append(chave)
-        log.info("── Processamento concluído: %s", chave)
+        # Sucesso: move para 'processados/' preservando subpastas
+        destino = _calcular_destino(chave, prefixo_origem, prefixo_processados)
+        _mover_arquivo_s3(hook, bucket, chave, destino)
+        log.info("── Sucesso: %s", chave)
+        return {"chave": chave, "status": "sucesso", "destino": destino}
 
-    ti.xcom_push(key="arquivos_processados", value=processados)
-    log.info("Total processado: %d arquivo(s).", len(processados))
+    except Exception as exc:
+        log.error("── Falha: %s | Erro: %s", chave, exc)
+
+        # Falha: move para 'erros/' preservando subpastas
+        destino_erro = _calcular_destino(chave, prefixo_origem, prefixo_erros)
+        try:
+            _mover_arquivo_s3(hook, bucket, chave, destino_erro)
+        except Exception as move_exc:
+            # Se não conseguir mover para erros, o arquivo permanece no lugar original
+            log.error(
+                "Não foi possível mover '%s' para erros: %s. "
+                "Arquivo permanece em s3://%s/%s.",
+                chave, move_exc, bucket, chave,
+            )
+            destino_erro = chave  # informa que ficou no lugar original
+
+        return {
+            "chave": chave,
+            "status": "falha",
+            "destino": destino_erro,
+            "erro": str(exc),
+        }
 
 
-def mover_para_processados(**context) -> None:
+# ─────────────────────────────────────────────────────────────────────────────
+# Tarefas da DAG
+# ─────────────────────────────────────────────────────────────────────────────
+def processar_arquivos(**context) -> None:
     """
-    Move os arquivos para o prefixo de 'processados' após sucesso.
-    Executada somente quando 'processar_arquivos' conclui sem erros.
+    Processa todos os arquivos encontrados pelo sensor.
+
+    Modo de execução controlado pelo parâmetro 'max_paralelo':
+      0  → sequencial: um arquivo por vez (ordem garantida, sem concorrência)
+      N  → paralelo:   até N arquivos processados simultaneamente
+
+    Cada arquivo é tratado de forma independente:
+      - Arquivos que concluem com sucesso são movidos para 'processados/'
+      - Arquivos que falham são movidos para 'erros/'
+      - Ambos preservam a estrutura de subpastas do prefixo monitorado
+
+    Ao final, se houver qualquer falha, a tarefa é marcada como FAILED
+    e os detalhes são publicados no XCom para a tarefa de notificação.
     """
     ti = context["ti"]
     params = context["params"]
-    hook, bucket = _get_s3_conn(params)
-    destino_base = params.get("prefixo_processados", _DEFAULT_PROCESSED).rstrip("/")
+
+    bucket = params.get("bucket", _DEFAULT_BUCKET)
+    prefixo_monitorado = params.get("prefixo_monitorado", _DEFAULT_PREFIX)
+    prefixo_processados = params.get("prefixo_processados", _DEFAULT_PROCESSED)
+    prefixo_erros = params.get("prefixo_erros", _DEFAULT_ERRORS)
+    aws_conn_id = params.get("aws_conn_id", _DEFAULT_CONN)
+    max_paralelo = int(params.get("max_paralelo", 0))
 
     arquivos: List[str] = ti.xcom_pull(
-        task_ids="processar_arquivos", key="arquivos_processados"
-    ) or []
-
-    if not arquivos:
-        log.warning("Nenhum arquivo para mover para 'processados'.")
-        return
-
-    for chave in arquivos:
-        nome = chave.split("/")[-1]
-        destino = f"{destino_base}/{nome}"
-        _mover_arquivo_s3(hook, bucket, chave, destino)
-
-    log.info("%d arquivo(s) movido(s) para '%s/'.", len(arquivos), destino_base)
-
-
-def mover_para_erros(**context) -> None:
-    """
-    Move os arquivos para o prefixo de 'erros' quando 'processar_arquivos' falha.
-    Executada somente quando a tarefa de processamento levanta uma exceção.
-    """
-    ti = context["ti"]
-    params = context["params"]
-    hook, bucket = _get_s3_conn(params)
-    destino_base = params.get("prefixo_erros", _DEFAULT_ERRORS).rstrip("/")
-
-    # Tenta obter a lista de arquivos encontrados pelo sensor
-    arquivos: List[str] = (
-        ti.xcom_pull(task_ids="monitorar_s3", key="arquivos_encontrados") or []
+        task_ids="monitorar_s3", key="arquivos_encontrados"
     )
 
     if not arquivos:
-        log.warning("Nenhum arquivo para mover para 'erros'.")
-        return
+        raise ValueError("Sensor não retornou arquivos para processar.")
 
-    for chave in arquivos:
-        nome = chave.split("/")[-1]
-        destino = f"{destino_base}/{nome}"
-        try:
-            _mover_arquivo_s3(hook, bucket, chave, destino)
-        except Exception as exc:
-            log.error(
-                "Falha ao mover '%s' para erros: %s. "
-                "O arquivo permanece em s3://%s/%s.",
-                chave, exc, bucket, chave,
-            )
+    modo = f"paralelo ({max_paralelo} workers)" if max_paralelo > 0 else "sequencial"
+    log.info("Modo: %s | Total de arquivos: %d", modo, len(arquivos))
 
-    log.info("%d arquivo(s) movido(s) para '%s/'.", len(arquivos), destino_base)
+    kwargs = dict(
+        bucket=bucket,
+        aws_conn_id=aws_conn_id,
+        prefixo_origem=prefixo_monitorado,
+        prefixo_processados=prefixo_processados,
+        prefixo_erros=prefixo_erros,
+    )
+
+    resultados: List[Dict] = []
+
+    if max_paralelo > 0:
+        # ── Modo paralelo: ThreadPoolExecutor ─────────────────────────────
+        # Cada arquivo é processado em uma thread separada.
+        # O número máximo de threads simultâneas é controlado por max_paralelo.
+        with ThreadPoolExecutor(max_workers=max_paralelo) as executor:
+            futures = {
+                executor.submit(_processar_um_arquivo, chave, **kwargs): chave
+                for chave in arquivos
+            }
+            for future in as_completed(futures):
+                resultados.append(future.result())
+    else:
+        # ── Modo sequencial: um arquivo de cada vez ───────────────────────
+        # A ordem de processamento é a mesma ordem retornada pelo sensor.
+        for chave in arquivos:
+            resultado = _processar_um_arquivo(chave, **kwargs)
+            resultados.append(resultado)
+
+    # Classifica os resultados
+    sucessos = [r for r in resultados if r["status"] == "sucesso"]
+    falhas = [r for r in resultados if r["status"] == "falha"]
+
+    log.info(
+        "Resultado final: %d sucesso(s) | %d falha(s) | %d total",
+        len(sucessos), len(falhas), len(resultados),
+    )
+
+    # Publica os resultados no XCom para uso pela tarefa de notificação
+    ti.xcom_push(key="resultados", value=resultados)
+    ti.xcom_push(key="falhas", value=falhas)
+
+    if falhas:
+        arquivos_com_falha = [f["chave"] for f in falhas]
+        raise AirflowException(
+            f"{len(falhas)} de {len(arquivos)} arquivo(s) falharam. "
+            f"Verifique o prefixo '{prefixo_erros}' no bucket '{bucket}'. "
+            f"Arquivos: {arquivos_com_falha}"
+        )
 
 
 def notificar_falha(**context) -> None:
     """
-    Registra detalhes da falha e aciona canal de notificação.
+    Registra os detalhes da falha e aciona o canal de notificação.
 
     Executada somente quando 'processar_arquivos' falha (trigger_rule=one_failed).
+    Lê os detalhes das falhas via XCom para incluir na notificação.
 
     ╔══════════════════════════════════════════════════════════════════╗
     ║  CUSTOMIZE AQUI: adicione o canal de notificação desejado.      ║
     ╚══════════════════════════════════════════════════════════════════╝
     """
+    ti = context["ti"]
     dag_run = context.get("dag_run")
-    ti = context.get("ti")
+
+    falhas: List[Dict] = (
+        ti.xcom_pull(task_ids="processar_arquivos", key="falhas") or []
+    )
+
+    detalhes = "\n".join(
+        f"  - {f['chave']}: {f.get('erro', 'erro desconhecido')}" for f in falhas
+    )
 
     log.error(
         "═══════════════════════════════════════════════════\n"
         "  FALHA NO PROCESSAMENTO S3\n"
-        "  DAG     : %s\n"
-        "  Run ID  : %s\n"
-        "  Tarefa  : %s\n"
+        "  DAG    : %s\n"
+        "  Run ID : %s\n"
+        "  Falhas : %d arquivo(s)\n"
+        "%s\n"
         "═══════════════════════════════════════════════════",
         dag_run.dag_id if dag_run else "N/A",
         dag_run.run_id if dag_run else "N/A",
-        ti.task_id if ti else "N/A",
+        len(falhas),
+        detalhes,
     )
 
     # ──────────────────────────────────────────────────────────────────
@@ -307,27 +386,28 @@ def notificar_falha(**context) -> None:
     #
     # ► Slack (requer provider: apache-airflow-providers-slack)
     #   from airflow.providers.slack.hooks.slack_webhook import SlackWebhookHook
-    #   slack = SlackWebhookHook(slack_webhook_conn_id="slack_default")
-    #   slack.send(text=f":x: *Falha no processamento S3*\n"
-    #                   f"DAG: `{dag_run.dag_id}` | Run: `{dag_run.run_id}`")
+    #   mensagem = (
+    #       f":x: *Falha no processamento S3*\n"
+    #       f"DAG: `{dag_run.dag_id}` | Run: `{dag_run.run_id}`\n"
+    #       f"Arquivos com falha:\n{detalhes}"
+    #   )
+    #   SlackWebhookHook(slack_webhook_conn_id="slack_default").send(text=mensagem)
     #
-    # ► E-mail (configure smtp_* no airflow.cfg ou via variáveis de ambiente)
+    # ► E-mail (configure smtp_* no airflow.cfg ou via env)
     #   from airflow.utils.email import send_email
     #   send_email(
     #       to=["equipe@empresa.com"],
-    #       subject=f"[Airflow] Falha: {dag_run.dag_id}",
-    #       html_content=f"<p>Run ID: {dag_run.run_id}</p>",
+    #       subject=f"[Airflow] Falha S3: {dag_run.dag_id}",
+    #       html_content=f"<pre>{detalhes}</pre>",
     #   )
     #
     # ► SNS (requer provider: apache-airflow-providers-amazon)
     #   from airflow.providers.amazon.aws.hooks.sns import SnsHook
-    #   sns = SnsHook(aws_conn_id="aws_default")
-    #   sns.publish_to_target(
-    #       target_arn="arn:aws:sns:us-east-1:123:meu-topico",
-    #       message=f"Falha na DAG {dag_run.dag_id}",
+    #   SnsHook(aws_conn_id="aws_default").publish_to_target(
+    #       target_arn="arn:aws:sns:us-east-1:123456789:meu-topico",
+    #       message=f"Falha na DAG {dag_run.dag_id}:\n{detalhes}",
     #   )
     # ──────────────────────────────────────────────────────────────────
-    log.error("Nenhum canal de notificação configurado. Adicione em notificar_falha().")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -352,8 +432,8 @@ def _on_failure_callback(context):
 # ─────────────────────────────────────────────────────────────────────────────
 with DAG(
     dag_id="s3_monitor_e_processar",
-    description="Monitora prefixo S3, processa arquivos e move conforme resultado",
-    schedule_interval=timedelta(minutes=5),  # Frequência de verificação
+    description="Monitora prefixo S3, processa arquivos (sequencial ou paralelo) e move conforme resultado",
+    schedule_interval=timedelta(minutes=5),
     start_date=days_ago(1),
     catchup=False,
     max_active_runs=1,  # Apenas uma execução simultânea para evitar duplicatas
@@ -372,6 +452,9 @@ with DAG(
         "prefixo_erros": _DEFAULT_ERRORS,
         "padrao_arquivo": _DEFAULT_PATTERN,
         "aws_conn_id": _DEFAULT_CONN,
+        # 0 = sequencial (um arquivo de cada vez)
+        # N = paralelo (N arquivos simultâneos)
+        "max_paralelo": 0,
     },
     tags=["s3", "monitoramento", "etl"],
 ) as dag:
@@ -388,51 +471,37 @@ with DAG(
         mode="reschedule",      # Libera o worker entre verificações (não bloqueia slot)
         soft_fail=True,         # Timeout → tarefa SKIPPED, não FAILED
         doc_md=(
-            "Aguarda novos arquivos no prefixo S3 configurado. "
-            "Quando encontrados, publica as chaves no XCom e libera o fluxo."
+            "Aguarda novos arquivos no prefixo S3 configurado (recursivo — inclui subpastas). "
+            "Quando encontrados, publica as chaves completas no XCom e libera o fluxo."
         ),
     )
 
-    # ── 2. Processa os arquivos encontrados ──────────────────────────────
+    # ── 2. Processa os arquivos e move cada um conforme resultado ────────
     processar = PythonOperator(
         task_id="processar_arquivos",
         python_callable=processar_arquivos,
         provide_context=True,
-        doc_md="Executa a lógica de negócio sobre cada arquivo encontrado.",
+        doc_md=(
+            "Processa cada arquivo individualmente (sequencial ou paralelo via 'max_paralelo'). "
+            "Sucesso → moved para 'processados/'. Falha → movido para 'erros/'. "
+            "Preserva estrutura de subpastas. Falha parcial é suportada."
+        ),
     )
 
-    # ── 3a. SUCESSO: move para 'processados/' ────────────────────────────
-    mover_processados = PythonOperator(
-        task_id="mover_para_processados",
-        python_callable=mover_para_processados,
-        provide_context=True,
-        # Executada somente quando 'processar_arquivos' conclui com sucesso (padrão)
-        doc_md="Move os arquivos para o prefixo 'processados/' após sucesso.",
-    )
-
-    # ── 3b. FALHA: move para 'erros/' ────────────────────────────────────
-    mover_erros = PythonOperator(
-        task_id="mover_para_erros",
-        python_callable=mover_para_erros,
-        provide_context=True,
-        trigger_rule="one_failed",  # Executada somente se 'processar_arquivos' falhar
-        doc_md="Move os arquivos para o prefixo 'erros/' quando o processamento falha.",
-    )
-
-    # ── 4. FALHA: notificação ─────────────────────────────────────────────
+    # ── 3. Notificação (executada somente se houver falha) ────────────────
     notificar = PythonOperator(
         task_id="notificar_falha",
         python_callable=notificar_falha,
         provide_context=True,
-        trigger_rule="one_failed",  # Executada somente se alguma tarefa anterior falhar
-        doc_md="Envia notificação de falha no processamento.",
+        trigger_rule="one_failed",  # Só executa se 'processar_arquivos' falhar
+        doc_md=(
+            "Envia notificação detalhada com os arquivos que falharam. "
+            "Configure o canal desejado (Slack, e-mail, SNS) na função notificar_falha()."
+        ),
     )
 
     # ─────────────────────────────────────────────────────────────────────
     # Fluxo:
-    #   monitorar_s3 → processar → mover_para_processados   (caminho feliz)
-    #                        └──→ mover_para_erros           (em caso de falha)
-    #                        └──→ notificar_falha            (em caso de falha)
+    #   monitorar_s3 → processar_arquivos → notificar_falha (só se falhar)
     # ─────────────────────────────────────────────────────────────────────
-    monitorar_s3 >> processar >> mover_processados
-    processar >> [mover_erros, notificar]
+    monitorar_s3 >> processar >> notificar
