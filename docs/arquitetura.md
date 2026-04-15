@@ -57,69 +57,56 @@ soft_fail         = True             # timeout → SKIPPED, não FAILED
 
 ---
 
----
-
 ## 1. Visão Geral do Fluxo
+
+> Para o diagrama completo ponta a ponta (AWS + Airflow + S3 destinos),
+> consulte [fluxo_completo.md](fluxo_completo.md).
 
 ```mermaid
 flowchart TD
-    SCHEDULER(["`**Scheduler Airflow**
-    Dispara a cada 5 minutos`"])
+    %% ── Gatilho ──────────────────────────────────────────────
+    UPLOAD(["👤 Upload do arquivo\nem incoming/"])
+    EB["⚡ EventBridge\nDetecta s3:ObjectCreated"]
+    LAMBDA["λ Lambda\nChama Airflow REST API"]
 
-    SCHEDULER --> SENSOR
+    UPLOAD -->|"① arquivo no S3"| EB
+    EB -->|"② invoca em segundos"| LAMBDA
+    LAMBDA -->|"③ POST /dagRuns\n{bucket, prefixo, arquivo}"| T1
 
-    subgraph TASK1 ["Tarefa 1 — monitorar_s3"]
-        SENSOR{"`**S3NovosArquivosSensor**
-        Verifica o prefixo S3
-        a cada 30 segundos`"}
-        AGUARDA["`⏳ Aguarda 30s
-        worker liberado
-        *(modo reschedule)*`"]
-        SENSOR -- "Sem arquivos" --> AGUARDA
-        AGUARDA --> SENSOR
+    %% ── DAG Airflow ──────────────────────────────────────────
+    subgraph TASK1 ["📡 Tarefa 1 — monitorar_s3"]
+        T1{"`Confirma que o arquivo
+        ainda está no S3
+        Timeout: 10 min`"}
     end
 
-    SENSOR -- "⏰ Timeout\n(4 horas sem arquivo)" --> SKIPPED
+    T1 -->|"✅ arquivo confirmado\nlista publicada no XCom"| TASK2
 
-    SKIPPED(["`Tarefa: **SKIPPED**
-    DAG encerra normalmente`"])
-
-    SENSOR -- "✅ Arquivos encontrados\n*(publica lista no XCom)*" --> TASK2
-
-    subgraph TASK2 ["Tarefa 2 — processar_arquivos"]
-        MODO{"`**max_paralelo?**`"}
-        SEQ["`🔁 Sequencial
-        *(um por vez)*`"]
-        PAR["`⚡ Paralelo
-        *(N simultâneos)*`"]
+    subgraph TASK2 ["⚙️ Tarefa 2 — processar_arquivos"]
+        MODO{"`max_paralelo?`"}
+        SEQ["`Sequencial\num por vez`"]
+        PAR["`Paralelo\nN simultâneos`"]
         MODO -- "= 0" --> SEQ
         MODO -- "> 0" --> PAR
         SEQ --> PROC
         PAR --> PROC
-        PROC["`Para cada arquivo:
-        executa lógica de negócio`"]
-        PROC -- "✅ Sucesso" --> MOV_OK["`Move para
-        **processed/AAAA/MM/DD/**`"]
-        PROC -- "❌ Falha" --> MOV_ERR["`Move para
-        **errors/**`"]
+        PROC["`Executa lógica\nde negócio`"]
+        PROC -- "✅" --> MOV_OK["`Move para\nprocessed/AAAA/MM/DD/`"]
+        PROC -- "❌" --> MOV_ERR["`Move para\nerrors/`"]
         MOV_OK --> VERIFICA
         MOV_ERR --> VERIFICA
-        VERIFICA{"`Houve
-        alguma falha?`"}
+        VERIFICA{"`Houve falha?`"}
     end
 
-    VERIFICA -- "Não" --> SUCCESS
-    VERIFICA -- "Sim\n*(publica falhas no XCom)*" --> TASK3
+    VERIFICA -- "Não" --> SUCCESS(["`✅ DAG: SUCCESS`"])
+    VERIFICA -- "Sim" --> TASK3
 
-    SUCCESS(["`DAG: **SUCCESS** ✅`"])
-
-    subgraph TASK3 ["Tarefa 3 — notificar_falha  *(trigger_rule = one_failed)*"]
-        NOTIF["`Lê detalhes das falhas
-        do XCom e envia notificação
-        *(Slack / E-mail / SNS)*`"]
+    subgraph TASK3 ["🔔 Tarefa 3 — notificar_falha  (só se falhar)"]
+        NOTIF["`Lê falhas do XCom
+        Slack / E-mail / SNS`"]
     end
 
-    TASK3 --> FAILED(["`DAG: **FAILED** ❌`"])
+    TASK3 --> FAILED(["`❌ DAG: FAILED`"])
 ```
 
 ---
